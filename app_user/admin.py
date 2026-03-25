@@ -132,8 +132,6 @@ def create_admin_app(store: UserAuthStore) -> Starlette:
         user = await store.get(email)
         if not user:
             return JSONResponse({"error": "User not found"}, status_code=404)
-        if user.revoke_after:
-            return JSONResponse({"error": "User is revoked"}, status_code=403)
 
         duration = body.get("duration_seconds", get_default_token_duration())
         return JSONResponse(_issue_token(email, duration))
