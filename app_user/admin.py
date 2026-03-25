@@ -5,7 +5,7 @@ JWT — same signing key as user tokens, with scope: "admin".
 """
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import jwt as pyjwt
 from starlette.applications import Starlette
@@ -15,6 +15,30 @@ from starlette.routing import Route
 
 from app_user.models import UserAuthRecord
 from app_user.store import UserAuthStore
+
+_FALLBACK_TOKEN_DURATION = 315360000  # ~10 years in seconds
+
+
+class InvalidTokenDurationError(ValueError):
+    """Raised when TOKEN_DURATION_SECONDS env var is not a valid integer."""
+    pass
+
+
+def get_default_token_duration() -> int:
+    """Resolve default token duration in seconds.
+
+    Priority: TOKEN_DURATION_SECONDS env var → _FALLBACK_TOKEN_DURATION.
+    Empty/unset env var silently falls back. Non-integer value raises.
+    """
+    raw = os.environ.get("TOKEN_DURATION_SECONDS")
+    if not raw:
+        return _FALLBACK_TOKEN_DURATION
+    try:
+        return int(raw)
+    except ValueError:
+        raise InvalidTokenDurationError(
+            f"TOKEN_DURATION_SECONDS must be an integer, got: {raw!r}"
+        )
 
 
 def create_admin_app(store: UserAuthStore) -> Starlette:
@@ -37,6 +61,25 @@ def create_admin_app(store: UserAuthStore) -> Starlette:
         except pyjwt.InvalidTokenError:
             return False
 
+    def _issue_token(email: str, duration_seconds: int | None = None) -> dict:
+        if duration_seconds is None:
+            duration_seconds = get_default_token_duration()
+        """Create a signed JWT for a user."""
+        now = datetime.now(timezone.utc)
+        payload = {
+            "sub": email,
+            "iat": now,
+            "exp": now + timedelta(seconds=duration_seconds),
+        }
+        if audience:
+            payload["aud"] = audience
+        token = pyjwt.encode(payload, signing_key, algorithm="HS256")
+        return {
+            "email": email,
+            "token": token,
+            "duration_seconds": duration_seconds,
+        }
+
     async def register_user(request: Request) -> JSONResponse:
         if not _verify_admin(request):
             return JSONResponse({"error": "Forbidden"}, status_code=403)
@@ -46,6 +89,8 @@ def create_admin_app(store: UserAuthStore) -> Starlette:
         if not email:
             return JSONResponse({"error": "email required"}, status_code=400)
 
+        duration = body.get("duration_seconds", get_default_token_duration())
+
         existing = await store.get(email)
         if not existing:
             await store.save(UserAuthRecord(
@@ -53,16 +98,7 @@ def create_admin_app(store: UserAuthStore) -> Starlette:
                 created=datetime.now(timezone.utc),
             ))
 
-        token = pyjwt.encode(
-            {
-                "sub": email,
-                "aud": audience,
-                "iat": datetime.now(timezone.utc),
-            },
-            signing_key,
-            algorithm="HS256",
-        )
-        return JSONResponse({"email": email, "token": token})
+        return JSONResponse(_issue_token(email, duration))
 
     async def list_users(request: Request) -> JSONResponse:
         if not _verify_admin(request):
@@ -83,8 +119,28 @@ def create_admin_app(store: UserAuthStore) -> Starlette:
         await store.save(user)
         return JSONResponse({"revoked": email})
 
+    async def create_token(request: Request) -> JSONResponse:
+        """Issue a new token for an existing, active user."""
+        if not _verify_admin(request):
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+        body = await request.json()
+        email = body.get("email")
+        if not email:
+            return JSONResponse({"error": "email required"}, status_code=400)
+
+        user = await store.get(email)
+        if not user:
+            return JSONResponse({"error": "User not found"}, status_code=404)
+        if user.revoke_after:
+            return JSONResponse({"error": "User is revoked"}, status_code=403)
+
+        duration = body.get("duration_seconds", get_default_token_duration())
+        return JSONResponse(_issue_token(email, duration))
+
     return Starlette(routes=[
         Route("/users", register_user, methods=["POST"]),
         Route("/users", list_users, methods=["GET"]),
         Route("/users/{email:path}", revoke_user, methods=["DELETE"]),
+        Route("/tokens", create_token, methods=["POST"]),
     ])
