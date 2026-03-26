@@ -1,5 +1,7 @@
 """create_app — compose any ASGI app with auth + admin endpoints."""
 
+import contextlib
+
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
@@ -9,12 +11,15 @@ from app_user.store import UserAuthStore
 from app_user.verifier import JWTVerifier
 
 
-def create_app(store: UserAuthStore, inner_app) -> Starlette:
+def create_app(store: UserAuthStore, inner_app, mcp=None) -> Starlette:
     """Wrap any ASGI app with JWT auth and admin endpoints.
 
     Args:
         store: Any UserAuthStore implementation.
         inner_app: The ASGI app to protect (FastMCP, FastAPI, Starlette, etc.)
+        mcp: Optional FastMCP instance. If provided, its session manager
+            lifespan is wired into the Starlette app so streamable HTTP
+            works correctly.
 
     Returns:
         A Starlette ASGI app combining:
@@ -29,7 +34,17 @@ def create_app(store: UserAuthStore, inner_app) -> Starlette:
     admin_app = create_admin_app(store)
     authed_inner = JWTMiddleware(inner_app, verifier)
 
-    return Starlette(routes=[
-        Mount("/admin", app=admin_app),
-        Mount("/", app=authed_inner),
-    ])
+    lifespan = None
+    if mcp is not None:
+        @contextlib.asynccontextmanager
+        async def lifespan(app):
+            async with mcp.session_manager.run():
+                yield
+
+    return Starlette(
+        routes=[
+            Mount("/admin", app=admin_app),
+            Mount("/", app=authed_inner),
+        ],
+        lifespan=lifespan,
+    )
